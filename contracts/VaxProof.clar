@@ -11,6 +11,9 @@
 (define-constant err-organization-not-found (err u107))
 (define-constant err-employee-not-found (err u108))
 (define-constant err-requirement-not-found (err u109))
+(define-constant err-batch-recalled (err u110))
+(define-constant err-batch-not-found (err u111))
+(define-constant err-batch-already-recalled (err u112))
 
 (define-map vaccination-records
     uint
@@ -39,6 +42,7 @@
 (define-data-var last-token-id uint u0)
 (define-data-var last-organization-id uint u0)
 (define-data-var last-requirement-id uint u0)
+(define-data-var last-batch-recall-id uint u0)
 
 (define-map organizations
     uint
@@ -94,6 +98,33 @@
     }
 )
 
+(define-map batch-recalls
+    uint
+    {
+        batch-number: (string-ascii 32),
+        vaccine-type: (string-ascii 64),
+        issuer: principal,
+        recall-reason: (string-ascii 256),
+        recalled-by: principal,
+        recall-date: uint,
+        affected-tokens: (list 100 uint),
+        status: (string-ascii 32)
+    }
+)
+
+(define-map recalled-batches (string-ascii 32) bool)
+
+(define-map batch-to-recall-id (string-ascii 32) uint)
+
+(define-map vaccination-batch-status
+    uint
+    {
+        batch-number: (string-ascii 32),
+        is-recalled: bool,
+        recall-id: (optional uint)
+    }
+)
+
 (define-read-only (get-last-token-id)
     (ok (var-get last-token-id))
 )
@@ -140,6 +171,29 @@
     (map-get? organization-statistics organization-id)
 )
 
+(define-read-only (is-batch-recalled (batch-number (string-ascii 32)))
+    (default-to false (map-get? recalled-batches batch-number))
+)
+
+(define-read-only (get-batch-recall (recall-id uint))
+    (map-get? batch-recalls recall-id)
+)
+
+(define-read-only (get-batch-recall-by-batch (batch-number (string-ascii 32)))
+    (match (map-get? batch-to-recall-id batch-number)
+        recall-id (map-get? batch-recalls recall-id)
+        none
+    )
+)
+
+(define-read-only (get-vaccination-batch-status (token-id uint))
+    (map-get? vaccination-batch-status token-id)
+)
+
+(define-read-only (get-last-batch-recall-id)
+    (ok (var-get last-batch-recall-id))
+)
+
 (define-public (register-issuer (issuer principal) (name (string-ascii 64)) (license-number (string-ascii 32)) (country (string-ascii 2)))
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
@@ -182,6 +236,7 @@
         (asserts! (> (len batch-number) u0) err-insufficient-requirements)
         (asserts! (> validity-period u0) err-insufficient-requirements)
         (asserts! (is-eq (len verification-hash) u32) err-insufficient-requirements)
+        (asserts! (not (is-batch-recalled batch-number)) err-batch-recalled)
         (try! (nft-mint? vax-proof new-token-id patient))
         (map-set vaccination-records new-token-id {
             patient: patient,
@@ -192,6 +247,11 @@
             expiration: expiration-time,
             verification-hash: verification-hash
         })
+        (map-set vaccination-batch-status new-token-id {
+            batch-number: batch-number,
+            is-recalled: false,
+            recall-id: none
+        })
         (var-set last-token-id new-token-id)
         (ok new-token-id)
     )
@@ -200,9 +260,12 @@
 (define-public (verify-vax-proof (token-id uint) (proof (buff 32)))
     (let (
         (record (unwrap! (map-get? vaccination-records token-id) err-not-found))
+        (batch-status (unwrap! (map-get? vaccination-batch-status token-id) err-not-found))
     )
         (asserts! (<= stacks-block-height (get expiration record)) err-expired)
         (asserts! (is-eq proof (get verification-hash record)) err-unauthorized)
+        (asserts! (not (get is-recalled batch-status)) err-batch-recalled)
+        (asserts! (not (is-batch-recalled (get batch-number record))) err-batch-recalled)
         (ok true)
     )
 )
@@ -388,3 +451,194 @@
         (ok current-stats)
     )
 )
+
+(define-public (recall-vaccination-batch 
+    (batch-number (string-ascii 32))
+    (vaccine-type (string-ascii 64))
+    (issuer principal)
+    (recall-reason (string-ascii 256))
+    (affected-tokens (list 100 uint)))
+    (let
+        (
+            (new-recall-id (+ (var-get last-batch-recall-id) u1))
+            (current-time stacks-block-height)
+        )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (> (len batch-number) u0) err-insufficient-requirements)
+        (asserts! (> (len vaccine-type) u0) err-insufficient-requirements)
+        (asserts! (> (len recall-reason) u0) err-insufficient-requirements)
+        (asserts! (not (is-batch-recalled batch-number)) err-batch-already-recalled)
+        (map-set batch-recalls new-recall-id {
+            batch-number: batch-number,
+            vaccine-type: vaccine-type,
+            issuer: issuer,
+            recall-reason: recall-reason,
+            recalled-by: tx-sender,
+            recall-date: current-time,
+            affected-tokens: affected-tokens,
+            status: "active"
+        })
+        (map-set recalled-batches batch-number true)
+        (map-set batch-to-recall-id batch-number new-recall-id)
+        (var-set last-batch-recall-id new-recall-id)
+        (unwrap! (update-affected-vaccinations-status affected-tokens new-recall-id batch-number) err-insufficient-requirements)
+        (ok new-recall-id)
+    )
+)
+
+(define-public (update-batch-recall-status (recall-id uint) (new-status (string-ascii 32)))
+    (let
+        (
+            (recall-record (unwrap! (map-get? batch-recalls recall-id) err-batch-not-found))
+            (current-time stacks-block-height)
+        )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (> (len new-status) u0) err-insufficient-requirements)
+        (map-set batch-recalls recall-id (merge recall-record {
+            status: new-status
+        }))
+        (ok true)
+    )
+)
+
+(define-public (reinstate-vaccination-batch (batch-number (string-ascii 32)))
+    (let
+        (
+            (recall-id (unwrap! (map-get? batch-to-recall-id batch-number) err-batch-not-found))
+            (recall-record (unwrap! (map-get? batch-recalls recall-id) err-batch-not-found))
+        )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (is-batch-recalled batch-number) err-batch-not-found)
+        (map-delete recalled-batches batch-number)
+        (map-set batch-recalls recall-id (merge recall-record {
+            status: "reinstated"
+        }))
+        (unwrap! (reinstate-affected-vaccinations (get affected-tokens recall-record)) err-insufficient-requirements)
+        (ok true)
+    )
+)
+
+(define-private (update-affected-vaccinations-status (token-ids (list 100 uint)) (recall-id uint) (batch-number (string-ascii 32)))
+    (begin
+        (map update-single-vaccination-status token-ids)
+        (ok true)
+    )
+)
+
+(define-private (update-single-vaccination-status (token-id uint))
+    (let
+        (
+            (batch-status (map-get? vaccination-batch-status token-id))
+        )
+        (match batch-status
+            status (begin
+                (map-set vaccination-batch-status token-id (merge status {
+                    is-recalled: true,
+                    recall-id: (map-get? batch-to-recall-id (get batch-number status))
+                }))
+                true
+            )
+            true
+        )
+    )
+)
+
+(define-private (reinstate-affected-vaccinations (token-ids (list 100 uint)))
+    (begin
+        (map reinstate-single-vaccination token-ids)
+        (ok true)
+    )
+)
+
+(define-private (reinstate-single-vaccination (token-id uint))
+    (let
+        (
+            (batch-status (map-get? vaccination-batch-status token-id))
+        )
+        (match batch-status
+            status (begin
+                (map-set vaccination-batch-status token-id (merge status {
+                    is-recalled: false,
+                    recall-id: none
+                }))
+                true
+            )
+            true
+        )
+    )
+)
+
+(define-public (check-vaccination-recall-status (token-id uint))
+    (let
+        (
+            (record (unwrap! (map-get? vaccination-records token-id) err-not-found))
+            (batch-status (unwrap! (map-get? vaccination-batch-status token-id) err-not-found))
+        )
+        (ok {
+            token-id: token-id,
+            batch-number: (get batch-number record),
+            is-batch-recalled: (is-batch-recalled (get batch-number record)),
+            is-token-recalled: (get is-recalled batch-status),
+            recall-id: (get recall-id batch-status)
+        })
+    )
+)
+
+(define-public (get-batch-recall-summary (batch-number (string-ascii 32)))
+    (let
+        (
+            (is-recalled (is-batch-recalled batch-number))
+            (recall-info (get-batch-recall-by-batch batch-number))
+        )
+        (ok {
+            batch-number: batch-number,
+            is-recalled: is-recalled,
+            recall-details: recall-info
+        })
+    )
+)
+
+(define-public (bulk-verify-vaccinations (token-ids (list 50 uint)))
+    (ok (map verify-single-vaccination-status token-ids))
+)
+
+(define-private (verify-single-vaccination-status (token-id uint))
+    (let
+        (
+            (record (map-get? vaccination-records token-id))
+            (batch-status (map-get? vaccination-batch-status token-id))
+        )
+        (match record
+            vax-record 
+                (match batch-status
+                    b-status {
+                        token-id: token-id,
+                        is-valid: (and 
+                            (<= stacks-block-height (get expiration vax-record))
+                            (not (get is-recalled b-status))
+                            (not (is-batch-recalled (get batch-number vax-record)))
+                        ),
+                        expiration: (get expiration vax-record),
+                        is-recalled: (get is-recalled b-status),
+                        batch-number: (get batch-number vax-record)
+                    }
+                    {
+                        token-id: token-id,
+                        is-valid: false,
+                        expiration: u0,
+                        is-recalled: false,
+                        batch-number: ""
+                    }
+                )
+            {
+                token-id: token-id,
+                is-valid: false,
+                expiration: u0,
+                is-recalled: false,
+                batch-number: ""
+            }
+        )
+    )
+)
+
+
